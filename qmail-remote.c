@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <idn2.h>
 #include "sig.h"
 #include "stralloc.h"
 #include "substdio.h"
@@ -42,6 +43,7 @@ stralloc helohost = {0};
 stralloc routes = {0};
 struct constmap maproutes;
 stralloc host = {0};
+stralloc asciihost = {0};
 stralloc sender = {0};
 
 saa reciplist = {0};
@@ -130,6 +132,7 @@ char smtpfrombuf[128];
 substdio smtpfrom = SUBSTDIO_FDBUF(saferead,-1,smtpfrombuf,sizeof smtpfrombuf);
 
 stralloc smtptext = {0};
+stralloc firstpart = {0};
 
 void get(ch)
 char *ch;
@@ -140,7 +143,56 @@ char *ch;
      if (!stralloc_append(&smtptext,ch)) temp_nomem();
 }
 
-unsigned long smtpcode()
+
+struct keywords {
+  char *text;
+  int *seen;
+} ;
+
+int esmtp = 0;
+
+struct keywords bannerkeywords[] = {
+  { "esmtp", &esmtp }
+, { 0, 0 }
+} ;
+
+int smtputf8 = 0;
+
+
+struct keywords ehlokeywords[] = {
+  { "smtputf8", &smtputf8 }
+, { 0, 0 }
+} ;
+
+
+void smtpline(kw, ch)
+struct keywords * kw;
+unsigned char ch;
+{
+  unsigned char lineprefix[1024];
+  unsigned char pos = 0;
+  int k;
+
+  while (ch != '\n') {
+    if (kw) if (pos < 1023) lineprefix[pos++] = ch;
+    get(&ch);
+  }
+  if (!kw) return;
+  lineprefix[pos++] = '\0';
+  for (k = 0;kw[k].text;++k) {
+    int p = 0;
+    while (p < pos && !*(kw[k].seen)) {
+      if ((p == 0 || lineprefix[p-1] == ' ' || lineprefix[p-1] == '-') &&
+          case_starts(lineprefix + p, kw[k].text))
+        *(kw[k].seen) = 1;
+      p++;
+    }
+  }
+}
+
+
+unsigned long smtpcode(kw)
+struct keywords * kw;
 {
   unsigned char ch;
   unsigned long code;
@@ -153,19 +205,19 @@ unsigned long smtpcode()
   for (;;) {
     get(&ch);
     if (ch != '-') break;
-    while (ch != '\n') get(&ch);
+    smtpline(kw, ch);
     get(&ch);
     get(&ch);
     get(&ch);
   }
-  while (ch != '\n') get(&ch);
+  smtpline(kw, ch);
 
   return code;
 }
 
 void outsmtptext()
 {
-  int i; 
+  int i;
   if (smtptext.s) if (smtptext.len) {
     out("Remote host said: ");
     for (i = 0;i < smtptext.len;++i)
@@ -194,6 +246,8 @@ void blast()
   int r;
   char ch;
 
+  substdio_put(&smtpto,firstpart.s,firstpart.len);
+
   for (;;) {
     r = substdio_get(&ssin,&ch,1);
     if (r == 0) break;
@@ -208,7 +262,7 @@ void blast()
     }
     substdio_put(&smtpto,"\r\n",2);
   }
- 
+
   flagcritical = 1;
   substdio_put(&smtpto,".\r\n",3);
   substdio_flush(&smtpto);
@@ -216,35 +270,128 @@ void blast()
 
 stralloc recip = {0};
 
+
+int containsutf8(p, l) unsigned char * p; int l;
+{
+  int i = 0;
+  while (i<l)
+    if(p[i++] > 127) return 1;
+  return 0;
+}
+
+
+int utf8message;
+
+void checkutf8message()
+{
+  int pos;
+  int i;
+  int r;
+  char ch;
+  int state;
+
+  if (containsutf8(sender.s, sender.len)) { utf8message = 1; return; }
+  for (i = 0;i < reciplist.len;++i)
+    if (containsutf8(reciplist.sa[i].s, reciplist.sa[i].len)) {
+      utf8message = 1;
+      return;
+    }
+
+  state = 0;
+  pos = 0;
+  for (;;) {
+    r = substdio_get(&ssin,&ch,1);
+    if (r == 0) break;
+    if (r == -1) temp_read();
+
+    if (ch == '\n' && !stralloc_cats(&firstpart,"\r")) temp_nomem();
+    if (!stralloc_append(&firstpart,&ch)) temp_nomem();
+
+    if (ch == '\r')
+      continue;
+    if (ch == '\t')
+      ch = ' ';
+
+    switch (state) {
+    case 6: /* in Received, at LF but before WITH clause */
+      if (ch == ' ') { state = 3; pos = 1; continue; }
+      state = 0;
+      /* FALL THROUGH */
+
+    case 0: /* start of header field */
+      if (ch == '\n') return;
+      state = 1;
+      pos = 0;
+      /* FALL THROUGH */
+
+    case 1: /* partway through "Received:" */
+      if (ch != "RECEIVED:"[pos] && ch != "received:"[pos]) { state = 2; continue; }
+      if (++pos == 9) { state = 3; pos = 0; }
+      continue;
+
+    case 2: /* other header field */
+      if (ch == '\n') state = 0;
+      continue;
+
+    case 3: /* in Received, before WITH clause or partway though " with " */
+      if (ch == '\n') { state = 6; continue; }
+      if (ch != " WITH "[pos] && ch != " with "[pos]) { pos = 0; continue; }
+      if (++pos == 6) { state = 4; pos = 0; }
+      continue;
+
+    case 4: /* in Received, having seen with, before the argument */
+      if (pos == 0 && ch == ' ') continue;
+      if (ch != "UTF8"[pos] && ch != "utf8"[pos]) { state = 5; continue; }
+      if(++pos == 4) { utf8message = 1; state = 5; continue; }
+      continue;
+
+    case 5: /* after the RECEIVED WITH argument */
+      /* blast() assumes that it copies whole lines */
+      if (ch == '\n') return;
+      state = 1;
+      pos = 0;
+      continue;
+    }
+  }
+}
+
 void smtp()
 {
   unsigned long code;
   int flagbother;
   int i;
- 
-  if (smtpcode() != 220) quit("ZConnected to "," but greeting failed");
- 
-  substdio_puts(&smtpto,"HELO ");
+
+  if (smtpcode(&bannerkeywords) != 220)
+    quit("ZConnected to "," but greeting failed");
+
+
+  substdio_puts(&smtpto,(esmtp ? "EHLO " : "HELO "));
   substdio_put(&smtpto,helohost.s,helohost.len);
   substdio_puts(&smtpto,"\r\n");
   substdio_flush(&smtpto);
-  if (smtpcode() != 250) quit("ZConnected to "," but my name was rejected");
- 
+  if (smtpcode(esmtp ? ehlokeywords : 0) != 250)
+    quit("ZConnected to "," but my name was rejected");
+
+  checkutf8message();
+  if (utf8message && !smtputf8) quit("DConnected to "," but server does not support unicode in email addresses");
+
   substdio_puts(&smtpto,"MAIL FROM:<");
   substdio_put(&smtpto,sender.s,sender.len);
-  substdio_puts(&smtpto,">\r\n");
+  substdio_puts(&smtpto,">");
+  if (utf8message) substdio_puts(&smtpto," smtputf8");
+  substdio_puts(&smtpto,"\r\n");
   substdio_flush(&smtpto);
-  code = smtpcode();
+  code = smtpcode(0);
   if (code >= 500) quit("DConnected to "," but sender was rejected");
   if (code >= 400) quit("ZConnected to "," but sender was rejected");
- 
+
   flagbother = 0;
   for (i = 0;i < reciplist.len;++i) {
     substdio_puts(&smtpto,"RCPT TO:<");
     substdio_put(&smtpto,reciplist.sa[i].s,reciplist.sa[i].len);
     substdio_puts(&smtpto,">\r\n");
     substdio_flush(&smtpto);
-    code = smtpcode();
+    code = smtpcode(0);
     if (code >= 500) {
       out("h"); outhost(); out(" does not like recipient.\n");
       outsmtptext(); zero();
@@ -259,14 +406,14 @@ void smtp()
     }
   }
   if (!flagbother) quit("DGiving up on ","");
- 
+
   substdio_putsflush(&smtpto,"DATA\r\n");
-  code = smtpcode();
+  code = smtpcode(0);
   if (code >= 500) quit("D"," failed on DATA command");
   if (code >= 400) quit("Z"," failed on DATA command");
- 
+
   blast();
-  code = smtpcode();
+  code = smtpcode(0);
   flagcritical = 0;
   if (code >= 500) quit("D"," failed after I sent the message");
   if (code >= 400) quit("Z"," failed after I sent the message");
@@ -283,9 +430,9 @@ int *flagalias;
 int flagcname;
 {
   int j;
- 
+
   *flagalias = flagcname;
- 
+
   j = str_rchr(s,'@');
   if (!s[j]) {
     if (!stralloc_copys(saout,s)) temp_nomem();
@@ -295,7 +442,7 @@ int flagcname;
   canonbox.len = j;
   if (!quote(saout,&canonbox)) temp_nomem();
   if (!stralloc_cats(saout,"@")) temp_nomem();
- 
+
   if (!stralloc_copys(&canonhost,s + j + 1)) temp_nomem();
   if (flagcname)
     switch(dns_cname(&canonhost)) {
@@ -338,22 +485,22 @@ char **argv;
   int flagallaliases;
   int flagalias;
   char *relayhost;
- 
+
   sig_pipeignore();
   if (argc < 4) perm_usage();
   if (chdir(auto_qmail) == -1) temp_chdir();
   getcontrols();
- 
- 
+
+
   if (!stralloc_copys(&host,argv[1])) temp_nomem();
- 
+
   relayhost = 0;
   for (i = 0;i <= host.len;++i)
     if ((i == 0) || (i == host.len) || (host.s[i] == '.'))
       if (relayhost = constmap(&maproutes,host.s + i,host.len - i))
         break;
   if (relayhost && !*relayhost) relayhost = 0;
- 
+
   if (relayhost) {
     i = str_chr(relayhost,':');
     if (relayhost[i]) {
@@ -361,14 +508,23 @@ char **argv;
       relayhost[i] = 0;
     }
     if (!stralloc_copys(&host,relayhost)) temp_nomem();
+  } else {
+    char * ascii;
+    host.s[host.len] = '\0';
+    switch (idn2_lookup_u8(host.s, (uint8_t**)&ascii, IDN2_NFC_INPUT)) {
+      case IDN2_OK: break;
+      case IDN2_MALLOC: temp_nomem();
+      default: perm_dns();
+    }
+    if (!stralloc_copys(&asciihost, ascii)) temp_nomem();
   }
 
 
   addrmangle(&sender,argv[2],&flagalias,0);
- 
+
   if (!saa_readyplus(&reciplist,0)) temp_nomem();
   if (ipme_init() != 1) temp_oserr();
- 
+
   flagallaliases = 1;
   recips = argv + 3;
   while (*recips) {
@@ -380,40 +536,40 @@ char **argv;
     ++recips;
   }
 
- 
+
   random = now() + (getpid() << 16);
-  switch (relayhost ? dns_ip(&ip,&host) : dns_mxip(&ip,&host,random)) {
+  switch (relayhost ? dns_ip(&ip,&host) : dns_mxip(&ip,&asciihost,random)) {
     case DNS_MEM: temp_nomem();
     case DNS_SOFT: temp_dns();
     case DNS_HARD: perm_dns();
     case 1:
       if (ip.len <= 0) temp_dns();
   }
- 
+
   if (ip.len <= 0) perm_nomx();
- 
+
   prefme = 100000;
   for (i = 0;i < ip.len;++i)
     if (ipme_is(&ip.ix[i].ip))
       if (ip.ix[i].pref < prefme)
         prefme = ip.ix[i].pref;
- 
+
   if (relayhost) prefme = 300000;
   if (flagallaliases) prefme = 500000;
- 
+
   for (i = 0;i < ip.len;++i)
     if (ip.ix[i].pref < prefme)
       break;
- 
+
   if (i >= ip.len)
     perm_ambigmx();
- 
+
   for (i = 0;i < ip.len;++i) if (ip.ix[i].pref < prefme) {
     if (tcpto(&ip.ix[i].ip)) continue;
- 
+
     smtpfd = socket(AF_INET,SOCK_STREAM,0);
     if (smtpfd == -1) temp_oserr();
- 
+
     if (timeoutconn(smtpfd,&ip.ix[i].ip,(unsigned int) port,timeoutconnect) == 0) {
       tcpto_err(&ip.ix[i].ip,0);
       partner = ip.ix[i].ip;
@@ -422,6 +578,6 @@ char **argv;
     tcpto_err(&ip.ix[i].ip,errno == error_timeout);
     close(smtpfd);
   }
-  
+
   temp_noconn();
 }

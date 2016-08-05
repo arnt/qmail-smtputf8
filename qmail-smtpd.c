@@ -86,8 +86,8 @@ stralloc helohost = {0};
 char *fakehelo; /* pointer into helohost, or 0 */
 
 void dohelo(arg) char *arg; {
-  if (!stralloc_copys(&helohost,arg)) die_nomem(); 
-  if (!stralloc_0(&helohost)) die_nomem(); 
+  if (!stralloc_copys(&helohost,arg)) die_nomem();
+  if (!stralloc_0(&helohost)) die_nomem();
   fakehelo = case_diffs(remotehost,helohost.s) ? helohost.s : 0;
 }
 
@@ -101,7 +101,7 @@ void setup()
 {
   char *x;
   unsigned long u;
- 
+
   if (control_init() == -1) die_control();
   if (control_rldef(&greeting,"control/smtpgreeting",1,(char *) 0) != 1)
     die_control();
@@ -116,12 +116,12 @@ void setup()
   if (bmfok == -1) die_control();
   if (bmfok)
     if (!constmap_init(&mapbmf,bmf.s,bmf.len,0)) die_nomem();
- 
+
   if (control_readint(&databytes,"control/databytes") == -1) die_control();
   x = env_get("DATABYTES");
   if (x) { scan_ulong(x,&u); databytes = u; }
   if (!(databytes + 1)) --databytes;
- 
+
   remoteip = env_get("TCPREMOTEIP");
   if (!remoteip) remoteip = "unknown";
   local = env_get("TCPLOCALHOST");
@@ -146,7 +146,7 @@ char *arg;
   struct ip_address ip;
   int flagesc;
   int flagquoted;
- 
+
   terminator = '>';
   i = str_chr(arg,'<');
   if (arg[i])
@@ -221,6 +221,7 @@ int seenmail = 0;
 int flagbarf; /* defined if seenmail */
 stralloc mailfrom = {0};
 stralloc rcptto = {0};
+int smtputf8 = 0;
 
 void smtp_helo(arg) char *arg;
 {
@@ -229,7 +230,7 @@ void smtp_helo(arg) char *arg;
 }
 void smtp_ehlo(arg) char *arg;
 {
-  smtp_greet("250-"); out("\r\n250-PIPELINING\r\n250 8BITMIME\r\n");
+  smtp_greet("250-"); out("\r\n250-PIPELINING\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n");
   seenmail = 0; dohelo(arg);
 }
 void smtp_rset(arg) char *arg;
@@ -239,7 +240,12 @@ void smtp_rset(arg) char *arg;
 }
 void smtp_mail(arg) char *arg;
 {
+  int i;
   if (!addrparse(arg)) { err_syntax(); return; }
+  i = str_len(arg);
+  while (i > 0 && (arg[i-1] == ' ' || arg[i-1] == '\t'))
+      arg[--i] = '\0';
+  smtputf8 = i > 8 && case_equals("smtputf8", arg + i - 8);
   flagbarf = bmfcheck();
   seenmail = 1;
   if (!stralloc_copys(&rcptto,"")) die_nomem();
@@ -300,7 +306,7 @@ int *hops;
   int flagmaybex; /* 1 if this line might match RECEIVED, if fih */
   int flagmaybey; /* 1 if this line might match \r\n, if fih */
   int flagmaybez; /* 1 if this line might match DELIVERED, if fih */
- 
+
   state = 1;
   *hops = 0;
   flaginheader = 1;
@@ -316,7 +322,7 @@ int *hops;
         if (flagmaybex) if (pos == 7) ++*hops;
         if (pos < 2) if (ch != "\r\n"[pos]) flagmaybey = 0;
         if (flagmaybey) if (pos == 1) flaginheader = 0;
-	++pos;
+        ++pos;
       }
       if (ch == '\n') { pos = 0; flagmaybex = flagmaybey = flagmaybez = 1; }
     }
@@ -369,7 +375,7 @@ void smtp_data(arg) char *arg; {
   int hops;
   unsigned long qp;
   char *qqx;
- 
+
   if (!seenmail) { err_wantmail(); return; }
   if (!rcptto.len) { err_wantrcpt(); return; }
   seenmail = 0;
@@ -377,14 +383,14 @@ void smtp_data(arg) char *arg; {
   if (qmail_open(&qqt) == -1) { err_qqt(); return; }
   qp = qmail_qp(&qqt);
   out("354 go ahead\r\n");
- 
-  received(&qqt,"SMTP",local,remoteip,remotehost,remoteinfo,fakehelo);
+
+  received(&qqt,smtputf8 ? "UTF8SMTP" : "SMTP",local,remoteip,remotehost,remoteinfo,fakehelo);
   blast(&hops);
   hops = (hops >= MAXHOPS);
   if (hops) qmail_fail(&qqt);
   qmail_from(&qqt,mailfrom.s);
   qmail_put(&qqt,rcptto.s,rcptto.len);
- 
+
   qqx = qmail_close(&qqt);
   if (!*qqx) { acceptmessage(qp); return; }
   if (hops) { out("554 too many hops, this message is looping (#5.4.6)\r\n"); return; }
